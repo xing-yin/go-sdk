@@ -632,11 +632,12 @@ type connReader struct {
 
 	mu      sync.Mutex // guards following
 	hasByte bool
+	// 缓存数据
 	byteBuf [1]byte
 	cond    *sync.Cond
 	inRead  bool
 	aborted bool  // set true before conn.rwc deadline is set to past
-	remain  int64 // bytes remaining
+	remain  int64 // bytes remaining 剩余可读的空间
 }
 
 func (cr *connReader) lock() {
@@ -836,6 +837,7 @@ func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	return bufio.NewWriterSize(w, size)
 }
 
+// 回收资源到资源池
 func putBufioWriter(bw *bufio.Writer) {
 	bw.Reset(nil)
 	if pool := bufioWriterPool(bw.Available()); pool != nil {
@@ -951,6 +953,7 @@ var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
 func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+	// 劫持（比如 websocket），http server 不再管理
 	if c.hijacked() {
 		return nil, ErrHijacked
 	}
@@ -975,6 +978,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 
 	c.r.setReadLimit(c.server.initialReadLimitSize())
 	if c.lastMethod == "POST" {
+		// 一个 RFC 7230 特殊的处理
 		// RFC 7230 section 3 tolerance for old buggy clients.
 		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
 		c.bufr.Discard(numLeadingCRorLF(peek))
@@ -992,10 +996,12 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	}
 
 	c.lastMethod = req.Method
+	// 清理掉读限制（无限）
 	c.r.setInfiniteReadLimit()
 
 	hosts, haveHost := req.Header["Host"]
 	isH2Upgrade := req.isH2Upgrade()
+	// 除非以下情况，需要有 Host Header
 	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
 		return nil, badRequestError("missing required Host header")
 	}
@@ -1022,18 +1028,20 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		body.doEarlyClose = true
 	}
 
+	// 调整一下超时
 	// Adjust the read deadline if necessary.
 	if !hdrDeadline.Equal(wholeReqDeadline) {
 		c.rwc.SetReadDeadline(wholeReqDeadline)
 	}
 
+	// 响应的结构体
 	w = &response{
 		conn:          c,
 		cancelCtx:     cancelCtx,
 		req:           req,
 		reqBody:       req.Body,
 		handlerHeader: make(Header),
-		contentLength: -1,
+		contentLength: -1, // -1:有些响应包没有这个字段
 		closeNotifyCh: make(chan bool, 1),
 
 		// We populate these ahead of time so we're not
@@ -1632,6 +1640,7 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 }
 
 func (w *response) finishRequest() {
+	// 标记处理完成了
 	w.handlerDone.Store(true)
 
 	if !w.wroteHeader {
@@ -1829,6 +1838,7 @@ func isCommonNetReadError(err error) bool {
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
 	c.remoteAddr = c.rwc.RemoteAddr().String()
+	// 存储本地地址
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	var inFlightResponse *response
 	defer func() {
@@ -1851,7 +1861,9 @@ func (c *conn) serve(ctx context.Context) {
 		}
 	}()
 
+	// 判断是否为 https 的链接
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
+		// 设置一些 https 的握手超时
 		tlsTO := c.server.tlsHandshakeTimeout()
 		if tlsTO > 0 {
 			dl := time.Now().Add(tlsTO)
@@ -1875,6 +1887,7 @@ func (c *conn) serve(ctx context.Context) {
 			c.rwc.SetReadDeadline(time.Time{})
 			c.rwc.SetWriteDeadline(time.Time{})
 		}
+		// 设置一下 tls 的字段的状态
 		c.tlsState = new(tls.ConnectionState)
 		*c.tlsState = tlsConn.ConnectionState()
 		if proto := c.tlsState.NegotiatedProtocol; validNextProto(proto) {
@@ -1892,15 +1905,19 @@ func (c *conn) serve(ctx context.Context) {
 
 	// HTTP/1.x from here on.
 
+	// cancelCtx 是一个函数，可以在发生错误时，通知上下游完成一些操作（比如释放资源）
 	ctx, cancelCtx := context.WithCancel(ctx)
 	c.cancelCtx = cancelCtx
+	// 每次运行完需要取消上下文（释放资源）
 	defer cancelCtx()
 
 	c.r = &connReader{conn: c}
+	// 带缓冲区的读写对象
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
 	for {
+		// 读取 http 连接
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
@@ -1947,7 +1964,7 @@ func (c *conn) serve(ctx context.Context) {
 			}
 		}
 
-		// Expect 100 Continue support
+		// Expect 100 Continue support：客户端传送大量数据，先发个 100-continue 来确认服务端能否正常接收
 		req := w.req
 		if req.expectsContinue() {
 			if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
@@ -1956,12 +1973,14 @@ func (c *conn) serve(ctx context.Context) {
 				w.canWriteContinue.Store(true)
 			}
 		} else if req.Header.get("Expect") != "" {
+			// 填入非法的值
 			w.sendExpectationFailed()
 			return
 		}
 
 		c.curReq.Store(w)
 
+		// 判断 body 中是否还有没有读取完的数据（保证上一个请求被处理完）
 		if requestBodyRemains(req.Body) {
 			registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
 		} else {
@@ -2280,9 +2299,9 @@ func RedirectHandler(url string, code int) Handler {
 // .. elements or repeated slashes to an equivalent, cleaner URL.
 type ServeMux struct {
 	mu    sync.RWMutex
-	m     map[string]muxEntry
-	es    []muxEntry // slice of entries sorted from longest to shortest.
-	hosts bool       // whether any patterns contain hostnames
+	m     map[string]muxEntry // 类似于 /home/get
+	es    []muxEntry          // slice of entries sorted from longest to shortest.
+	hosts bool                // whether any patterns contain hostnames
 }
 
 type muxEntry struct {
@@ -2344,6 +2363,7 @@ func (mux *ServeMux) match(path string) (h Handler, pattern string) {
 
 	// Check for longest valid match.  mux.es contains all patterns
 	// that end in / sorted from longest to shortest.
+	// mux.es 从长到短可以更加精确的匹配
 	for _, e := range mux.es {
 		if strings.HasPrefix(path, e.pattern) {
 			return e.h, e.pattern
@@ -2582,6 +2602,7 @@ type Server struct {
 	// See net.Dial for details of the address format.
 	Addr string
 
+	// Handler 即注册的路由
 	Handler Handler // handler to invoke, http.DefaultServeMux if nil
 
 	// DisableGeneralOptionsHandler, if true, passes "OPTIONS *" requests to the Handler,
@@ -2595,6 +2616,7 @@ type Server struct {
 	// tls.Config.SetSessionTicketKeys. To use
 	// SetSessionTicketKeys, use Server.Serve with a TLS Listener
 	// instead.
+	// 用于给 https 使用的
 	TLSConfig *tls.Config
 
 	// ReadTimeout is the maximum duration for reading the entire
@@ -2649,6 +2671,7 @@ type Server struct {
 	// ConnState specifies an optional callback function that is
 	// called when a client connection changes state. See the
 	// ConnState type and associated constants for details.
+	// 用于管理连接的状态（ConnState 有几个枚举值）
 	ConnState func(net.Conn, ConnState)
 
 	// ErrorLog specifies an optional logger for errors accepting
@@ -2677,7 +2700,8 @@ type Server struct {
 	nextProtoOnce     sync.Once // guards setupHTTP2_* init
 	nextProtoErr      error     // result of http2.ConfigureServer if used
 
-	mu         sync.Mutex
+	mu sync.Mutex
+	// 用于追踪
 	listeners  map[*net.Listener]struct{}
 	activeConn map[*conn]struct{}
 	onShutdown []func()
@@ -2861,6 +2885,7 @@ const (
 
 	// StateHijacked represents a hijacked connection.
 	// This is a terminal state. It does not transition to StateClosed.
+	// 一旦使用劫持，可以由用户自己控制 TCP 的连接和关闭（不再是由 sdk 控制）
 	StateHijacked
 
 	// StateClosed represents a closed connection.
@@ -2954,6 +2979,7 @@ func (srv *Server) ListenAndServe() error {
 	}
 	addr := srv.Addr
 	if addr == "" {
+		// 这个字符串后续会被替换为 80 端口
 		addr = ":http"
 	}
 	ln, err := net.Listen("tcp", addr)
@@ -3002,11 +3028,13 @@ var ErrServerClosed = errors.New("http: Server closed")
 // Serve always returns a non-nil error and closes l.
 // After Shutdown or Close, the returned error is ErrServerClosed.
 func (srv *Server) Serve(l net.Listener) error {
+	// 需要测试钩子函数时使用，正常情况下为空
 	if fn := testHookServerServe; fn != nil {
 		fn(srv, l) // call hook with unwrapped listener
 	}
 
 	origListener := l
+	// 包装一下，确保只被调用一次
 	l = &onceCloseListener{Listener: l}
 	defer l.Close()
 
@@ -3059,8 +3087,10 @@ func (srv *Server) Serve(l net.Listener) error {
 			}
 		}
 		tempDelay = 0
+		// 包装为一个新的 connection
 		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
+		// 启用一个新的协程处理
 		go c.serve(connCtx)
 	}
 }

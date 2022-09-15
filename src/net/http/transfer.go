@@ -817,7 +817,7 @@ type body struct {
 	doEarlyClose bool          // whether Close should stop early
 
 	mu         sync.Mutex // guards following, and calls to Read and Close
-	sawEOF     bool
+	sawEOF     bool       // 结尾是 EOF 字符
 	closed     bool
 	earlyClose bool   // Close called and we didn't read to the end of src
 	onHitEOF   func() // if non-nil, func to call when EOF is Read
